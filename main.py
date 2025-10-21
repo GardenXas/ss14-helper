@@ -9,7 +9,7 @@ import json
 import time
 import re
 from collections import deque
-from urllib.parse import urljoin, urlparse, unquote # <-- ДОБАВЛЕН unquote
+from urllib.parse import urljoin, urlparse, unquote
 
 # Импорты для красивого интерфейса
 from rich.console import Console
@@ -163,18 +163,11 @@ def setup_database():
     metadata.create_all(engine)
 
 def truncate_text(text, max_length=50):
-    """Обрезает текст, если он слишком длинный."""
-    if len(text) > max_length:
-        return text[:max_length-3] + "..."
-    return text
+    return (text[:max_length-3] + "...") if len(text) > max_length else text
 
 def create_layout() -> Layout:
-    """Создает статичную структуру интерфейса."""
     layout = Layout(name="root")
-    layout.split(
-        Layout(Panel("SS14 Helper - Обновление Базы", style="bold blue"), name="header", size=3),
-        Layout(name="main"),
-    )
+    layout.split(Layout(Panel("SS14 Helper - Обновление Базы", style="bold blue"), name="header", size=3), Layout(name="main"))
     return layout
 
 def fetch_servers_with_progress(progress, task_id):
@@ -220,12 +213,9 @@ def run_crawler_with_progress(progress, task_id, start_url):
     while pages_to_crawl and not progress.tasks[task_id].finished:
         current_url = pages_to_crawl.popleft()
         if current_url in crawled_pages: continue
-        
-        # --- ИСПРАВЛЕНИЕ 1: Декодируем URL перед отображением ---
         decoded_url_part = unquote(current_url.split('/')[-1])
         short_url = truncate_text(decoded_url_part, 40)
         progress.update(task_id, description=f"[cyan]Анализ {base_netloc}:[/cyan] {short_url}")
-        
         crawled_pages.add(current_url)
         title, found_links = scrape_and_find_links(current_url)
         if title:
@@ -238,8 +228,6 @@ def run_crawler_with_progress(progress, task_id, start_url):
             if full_url not in crawled_pages and full_url not in pages_to_crawl:
                 pages_to_crawl.append(full_url)
         time.sleep(0.1)
-
-    # --- ИСПРАВЛЕНИЕ 2: Завершаем прогресс-бар и показываем реальное количество ---
     progress.update(task_id, completed=max_pages, description=f"[green]Анализ {base_netloc} завершен ({pages_count} стр.)[/green]")
 
 def autonomous_update():
@@ -268,12 +256,26 @@ def autonomous_update():
 # --- МОДУЛЬ ВЗАИМОДЕЙСТВИЯ С GEMINI AI ---
 # ==============================================================================
 
+# --- НОВОЕ: Список стоп-слов для отсеивания мусора из поисковых запросов ---
+STOP_WORDS = {
+    'кто', 'такие', 'что', 'такое', 'как', 'где', 'почему', 'зачем', 'какой', 'какие',
+    'быть', 'есть', 'или', 'не', 'на', 'в', 'с', 'по', 'для', 'из', 'у', 'о', 'об',
+    'а', 'и', 'но', 'да', 'то', 'же', 'бы', 'вот', 'уже', 'тут', 'там', 'этот', 'тот',
+    'мой', 'твой', 'свой', 'наш', 'ваш', 'их', 'его', 'ее', 'они', 'мы', 'вы', 'я', 'он',
+    'она', 'оно', 'мне', 'тебе', 'ему', 'ей', 'нам', 'вам', 'им', 'меня', 'тебя', 'его',
+    'ее', 'нас', 'вас', 'их', 'мной', 'тобой', 'им', 'ей', 'нами', 'вами', 'ими',
+    'делать', 'сделать', 'выбрать', 'построить', 'найти'
+}
+
 def find_relevant_context(keywords, server_context="all"):
-    if not keywords: return ""
+    # --- ИЗМЕНЕНИЕ: Отфильтровываем стоп-слова ---
+    meaningful_keywords = [kw for kw in keywords if kw not in STOP_WORDS]
+    if not meaningful_keywords: return ""
+
     context = ""
     with engine.connect() as connection:
-        search_conditions = " OR ".join([f"content LIKE :kw{i}" for i in range(len(keywords))])
-        params = {f"kw{i}": f"%{keyword}%" for i, keyword in enumerate(keywords)}
+        search_conditions = " OR ".join([f"content LIKE :kw{i}" for i in range(len(meaningful_keywords))])
+        params = {f"kw{i}": f"%{keyword}%" for i, keyword in enumerate(meaningful_keywords)}
         query_str = f"SELECT title, content FROM wiki_articles WHERE ({search_conditions})"
         if server_context != "all":
             base_url = urlparse(server_context).netloc
@@ -288,8 +290,8 @@ def find_relevant_context(keywords, server_context="all"):
 
 def get_refined_search_keywords_from_gemini(query):
     api_key = SETTINGS.get("gemini_api_key", "")
-    prompt = f"""Проанализируй запрос пользователя об игре Space Station 14. Преврати его в список ключевых слов или фраз для поиска по базе данных. Выведи только ключевые слова через запятую.
-Запрос пользователя: "{query}"
+    prompt = f"""Проанализируй запрос пользователя об игре Space Station 14. Преврати его в список ключевых слов. Выведи только ключевые слова через запятую.
+Запрос: "{query}"
 Ответ:"""
     payload = { "contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"temperature": 0.0} }
     headers = {'Content-Type': 'application/json', 'Authorization': f'Bearer {api_key}'}
@@ -322,18 +324,24 @@ def ask_gemini(query):
             if refined_keywords:
                 live.update(Spinner('dots', text="[cyan]Ищу по уточненным словам...[/cyan]"))
                 context = find_relevant_context(refined_keywords, server_context="all")
+        
         if not context:
-            live.update(Spinner('dots', text="[cyan]Локально не найдено. Спрашиваю Gemini с контекстом игры...[/cyan]"))
-            prompt = f"Ты — эксперт-помощник по игре Space Station 14. Ответь на следующий вопрос, касающийся этой игры: '{query}'"
+            live.update(Spinner('dots', text="[cyan]Локально не найдено. Формирую общий запрос для Gemini...[/cyan]"))
+            prompt = f"Ты — эксперт-помощник по игре Space Station 14. Ответь на следующий вопрос, используя свои знания об этой игре. Всегда отвечай в контексте игры. Вопрос: '{query}'"
         else:
             live.update(Spinner('dots', text="[cyan]Информация найдена. Формирую точный запрос для Gemini...[/cyan]"))
-            prompt = f"""Ты — эксперт-помощник по игре Space Station 14. Используя ТОЛЬКО предоставленный ниже контекст из игровой вики, дай подробный ответ на вопрос.
-Контекст:
+            prompt = f"""Ты — эксперт-помощник по игре Space Station 14. Твоя задача - ответить на вопрос пользователя.
+Используй предоставленные выдержки из игровой вики как ОСНОВНОЙ и ПРИОРИТЕТНЫЙ источник информации.
+Если в этих выдержках нет ответа или он неполный, ДОПОЛНИ его своими собственными знаниями об игре Space Station 14.
+Всегда оставайся в контексте игры.
+
+КОНТЕКСТ ИЗ ВИКИ:
 ---
 {context}
 ---
-Вопрос: {query}"""
-        payload = { "contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"maxOutputTokens": 8192, "temperature": 0.5}, "safetySettings": [{"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_ONLY_HIGH"}, {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_ONLY_HIGH"}, {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_ONLY_HIGH"}, {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_ONLY_HIGH"}] }
+ВОПРОС ПОЛЬЗОВАТЕЛЯ: {query}"""
+
+        payload = { "contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"maxOutputTokens": 8192, "temperature": 0.6}, "safetySettings": [{"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_ONLY_HIGH"}, {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_ONLY_HIGH"}, {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_ONLY_HIGH"}, {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_ONLY_HIGH"}] }
         headers = {'Content-Type': 'application/json', 'Authorization': f'Bearer {api_key}'}
         try:
             live.update(Spinner('dots', text="[cyan]Отправляю финальный запрос на прокси-сервер...[/cyan]"))
